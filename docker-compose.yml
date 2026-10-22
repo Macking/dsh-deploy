@@ -1,0 +1,60 @@
+services:
+  # ──────────────────────────────────────────────────────────────
+  # DeepSeek Harness (dsh) — official open-source agent harness
+  # Runs on 127.0.0.1:3080 (loopback only, by design).
+  # Uses network_mode: host so nginx (also host network) can reach it.
+  # ──────────────────────────────────────────────────────────────
+  deepseek-harness:
+    build:
+      context: ./dsh
+      dockerfile: Dockerfile
+    image: dsh/harness:latest
+    container_name: dsh-harness
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # DSH home directory (persisted via volume)
+      - DSH_HOME=/dsh-home
+      # Browser-facing URL that dsh advertises in its UI and startup output.
+      # Read from .env so the same compose file works on any server IP.
+      - DSH_PUBLIC_URL=${DSH_PUBLIC_URL:-http://localhost/}
+      # The authority browsers use to reach the deployment.
+      # DSH's host fence rejects any other Host header, so set this to the
+      # browser-visible hostname or IP. An entry without a port matches any port.
+      # Read from .env so the same compose file works on any server IP.
+      - DSH_TRUSTED_HOST=${DSH_TRUSTED_HOST:-localhost}
+      # DeepSeek API key — set in .env or here directly.
+      # The web UI also lets you configure models at runtime via Settings.
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+    volumes:
+      - dsh-home:/dsh-home
+      - dsh-workspace:/workspace
+    healthcheck:
+      # DSH returns 401 for unauthenticated API pings, which is a healthy
+      # response (server is up). We only fail on 000 (connection refused).
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/ | grep -qv '000'"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ──────────────────────────────────────────────────────────────
+  # Nginx reverse proxy — exposes dsh's 3080 loopback to port 80
+  # Uses network_mode: host so it can proxy to 127.0.0.1:3080
+  # where the dsh container is listening.
+  # ──────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: dsh-nginx
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      deepseek-harness:
+        condition: service_healthy
+
+volumes:
+  dsh-home:
+  dsh-workspace:

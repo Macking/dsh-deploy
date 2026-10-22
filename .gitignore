@@ -1,0 +1,14 @@
+# .env contains secrets — never commit it
+.env
+.env.*
+!.env.example
+
+# Docker build artifacts
+dsh/node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp
+.tmp/
