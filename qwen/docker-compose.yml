@@ -1,0 +1,83 @@
+# =====================================================================
+# docker compose 编排：拉起内置 Qwen3.8-Flash 的 spark-vllm-b12x 镜像。
+#
+# 等价还原原 `docker run` 的全部运行时参数：
+#   --gpus all / --ipc host / --network host / --shm-size 16g
+#   --ulimit memlock=-1 / --ulimit stack=67108864
+#   --security-opt seccomp=unconfined / --security-opt apparmor=unconfined
+#   各 -e 与 -v 挂载（-e 已烘焙进镜像，见 Dockerfile）。
+#
+# 用法（在 qwen/ 目录或仓库根目录执行均可）：
+#   构建并启动：  docker compose -f qwen/docker-compose.yml up -d --build
+#   跟随日志：    docker compose -f qwen/docker-compose.yml logs -f
+#   停止：        docker compose -f qwen/docker-compose.yml down
+#
+# 部署前请在宿主机先创建好缓存目录（首次运行需要写权限）：
+#   mkdir -p ~/.cache/{huggingface,vllm,flashinfer,b12x} ~/.triton
+# 并确保 ${HOME} 在宿主机 shell 中已设置（通常默认即有）；
+# 若未设置，请把下方 ${HOME} 改成绝对路径，例如 /home/test。
+# =====================================================================
+services:
+  vllm-serve:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: spark-vllm-b12x-qwen3.8-flash:latest
+    container_name: qwen-vllm-serve
+
+    # ---- 网络 / IPC（等价 --network host --ipc host）----------------
+    # vllm 监听 0.0.0.0:8000，host 网络下直接占用宿主机 :8000。
+    network_mode: host
+    ipc: host
+
+    # ---- 共享内存（等价 --shm-size 16g）-----------------------------
+    shm_size: 16g
+
+    # ---- GPU（等价 --gpus all）--------------------------------------
+    # 非 swarm 模式下 docker compose v2 同样会应用该 GPU 预留。
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # ---- ulimit（等价 --ulimit memlock=-1 --ulimit stack=67108864）---
+    # 单值形式同时设置 soft=hard，与 `--ulimit name=value` 行为一致。
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+    # ---- security-opt（等价 --security-opt seccomp=unconfined
+    #                     --security-opt apparmor=unconfined）----------
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+
+    # ---- 卷挂载（模型只读 + 各类缓存）-------------------------------
+    # /home/test/project 为宿主机模型目录（原命令字面值，按需修改）。
+    # 其余 ${HOME}/... 为宿主机缓存目录，与容器内路径一一对应。
+    volumes:
+      - /home/test/project:/models/local:ro
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ${HOME}/.cache/vllm:/root/.cache/vllm
+      - ${HOME}/.cache/flashinfer:/root/.cache/flashinfer
+      - ${HOME}/.triton:/root/.triton
+      - ${HOME}/.cache/b12x:/root/.cache/b12x
+
+    # ---- 重启策略（项目惯例，便于服务常驻）--------------------------
+    restart: unless-stopped
+
+    # ---- 命中 vllm /health 的健康检查（项目惯例）--------------------
+    # FP4 模型加载约 20 分钟，start_period 给足 25 分钟启动宽限期。
+    # 该镜像无 `python` 符号链接，仅有 python3，故探测命令用 python3；
+    # 也可改用自带 curl（curl 8.5 已确认存在于镜像）。
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status==200 else 1)\" || curl -fsS http://127.0.0.1:8000/health >/dev/null"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 1500s
