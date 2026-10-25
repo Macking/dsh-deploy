@@ -30,6 +30,8 @@
 #   DOWNLOAD_TOOL   下载工具，wget 或 aria2c（hfd.sh 默认 aria2c，本脚本默认 wget）。
 #   HF_TOKEN        HuggingFace 访问令牌（gated 仓库需要）。
 #   HF_USERNAME     HuggingFace 用户名（gated 仓库需要）。
+#   HF_ENDPOINT     HuggingFace 下载端点，默认 https://hf-mirror.com（国内镜像），
+#                   避免直连 https://huggingface.co 超时。可在外层覆盖为官方源。
 #
 # 新机器完整流程：
 #   git clone https://github.com/Macking/dsh-deploy.git "$HOME/dsh-deploy"
@@ -93,6 +95,8 @@ run_model_download() {
   local dir="$DSH_DEPLOY_HOME/models/$repo"
   local tool="${DOWNLOAD_TOOL:-wget}"
   local hfd="$DSH_DEPLOY_HOME/scripts/hfd.sh"
+  # 默认走国内镜像，避免直连 huggingface.co 超时；已设置则尊重用户覆盖
+  export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
   # 模型 ID 同时用作本地子目录名，拒绝绝对路径与路径越界（防止 .. 跳出 models/）
   if [[ "$repo" == /* || "$repo" == *..* ]]; then
@@ -106,8 +110,8 @@ run_model_download() {
     return 1
   fi
 
-  printf "%b[prepare.sh] 开始下载模型 %s -> %s（工具 %s）%b\n" \
-    "$BOLD" "$repo" "$dir" "$tool" "$NC"
+  printf "%b[prepare.sh] 开始下载模型 %s -> %s（工具 %s，镜像 %s）%b\n" \
+    "$BOLD" "$repo" "$dir" "$tool" "$HF_ENDPOINT" "$NC"
 
   # 透传 HF 凭证（仅在已设置时附加；gated 仓库需要）
   local -a args=("$repo" --local-dir "$dir" --tool "$tool")
@@ -121,7 +125,7 @@ run_model_download() {
     printf "%b[prepare.sh] 模型下载完成：%s%b\n" "$GREEN" "$dir" "$NC"
   else
     printf "%b[prepare.sh] 模型下载未完成（退出码 %s）。可重新执行本脚本续传，或直接：%b\n" "$YELLOW" "$rc" "$NC" >&2
-    printf "%b            bash %s %s%b\n" "$YELLOW" "$hfd" "${args[*]}" "$NC" >&2
+    printf "%b            HF_ENDPOINT=%s bash %s %s%b\n" "$YELLOW" "$HF_ENDPOINT" "$hfd" "${args[*]}" "$NC" >&2
   fi
   return $rc
 }
