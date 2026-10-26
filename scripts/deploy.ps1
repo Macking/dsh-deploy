@@ -1,55 +1,67 @@
-<#
+﻿<#
 .SYNOPSIS
-    DSH (DeepSeek Harness) deployment script.
-    Deploys the nginx + deepseek-harness containers to a remote Ubuntu server via SSH.
+    DSH 全栈部署脚本（PowerShell 版）— 一键部署 vLLM + DeepSeek Harness 到全新远程服务器。
 
 .DESCRIPTION
-    Architecture:
-      - Container 1 (dsh-harness): Node.js image running the official
-        `dsh web` CLI from @deepseek-ai/dsh. Binds to 127.0.0.1:3080 (loopback only).
-      - Container 2 (dsh-nginx):  Nginx reverse proxy, port 80 -> 127.0.0.1:3080.
-      Both containers use network_mode: host so nginx can reach dsh's loopback.
+    上传项目文件后，依次在远程执行三个脚本：
+      1. scripts/prepare.sh    — 写入 .env + 下载模型权重（hfd.sh，可断点续传）
+      2. scripts/start-vllm.sh — 构建并启动 vLLM 模型服务（qwen/docker-compose.yml）
+      3. scripts/start-ai.sh   — 构建并启动 DSH Agent + Nginx，输出带 token 的 WebUI URL
 
-    Steps:
-      1. Uploads project files to the remote server via SFTP.
-      2. Builds the dsh Docker image (Node.js + npx @deepseek-ai/dsh).
-      3. Starts all services with docker compose.
-      4. Verifies the deployment.
+    全新机器只需安装 Docker + Docker Compose；脚本自动处理其余一切。
+
+    Architecture:
+      - vllm-serve  : vLLM model service (Qwen3.8-Flash-Next-FP4), port 8000, host network
+      - dsh-harness : DeepSeek Harness agent, binds 127.0.0.1:3080 (loopback only)
+      - dsh-nginx   : Nginx reverse proxy, port 80 → 127.0.0.1:3080
+      All containers use network_mode: host.
 
 .PARAMETER RemoteHost
-    Remote server IP or hostname. Default: 192.168.76.12
+    远程服务器 IP 或主机名。默认：192.168.76.248
 
 .PARAMETER User
-    SSH username. Default: macking
+    SSH 用户名。默认：test
 
 .PARAMETER Password
-    SSH password. Default: 12345678
+    SSH 密码。默认：123456
 
 .PARAMETER RemotePath
-    Deployment directory on the remote server. Default: /home/<User>/dsh
+    远程部署目录。默认：/home/<User>/dsh-deploy
 
 .PARAMETER PublicHost
-    Browser-facing hostname or IP for DSH_PUBLIC_URL and DSH_TRUSTED_HOST.
-    Defaults to $RemoteHost. Set this when the public URL differs from the
-    SSH host (e.g., a domain name or load balancer IP).
+    浏览器访问的主机名或 IP（用于 DSH_PUBLIC_URL / DSH_TRUSTED_HOST）。
+    默认与 RemoteHost 相同；若通过域名或负载均衡器访问则需单独指定。
+
+.PARAMETER ModelId
+    HuggingFace 模型 ID。默认：nvidia/Qwen3.8-Flash-Next-FP4-Local
+
+.PARAMETER ServedModelName
+    vllm --served-model-name 的值。默认：qwen3.8-flash
+
+.PARAMETER DeepseekApiKey
+    DeepSeek API 密钥（可选，也可在 Web UI Settings > Models 中运行时配置）。
 
 .EXAMPLE
     .\scripts\deploy.ps1
-    .\scripts\deploy.ps1 -RemoteHost 192.168.76.12 -User macking -Password 12345678
+    .\scripts\deploy.ps1 -RemoteHost 192.168.76.248 -User test -Password 123456
     .\scripts\deploy.ps1 -RemoteHost 10.0.0.50 -PublicHost dsh.example.com
+    .\scripts\deploy.ps1 -ModelId Qwen/Qwen3-32B -ServedModelName my-qwen
+    .\scripts\deploy.ps1 -DeepseekApiKey sk-xxx
 #>
 
 param(
-    [string]$RemoteHost = "192.168.76.12",
-    [string]$User       = "macking",
-    [string]$Password   = "12345678",
-    [string]$RemotePath = "",
-    [string]$PublicHost = ""
+    [string]$RemoteHost       = "192.168.76.248",
+    [string]$User             = "test",
+    [string]$Password         = "123456",
+    [string]$RemotePath       = "",
+    [string]$PublicHost       = "",
+    [string]$ModelId          = "nvidia/Qwen3.8-Flash-Next-FP4-Local",
+    [string]$ServedModelName  = "qwen3.8-flash",
+    [string]$DeepseekApiKey   = ""
 )
 
-# RemotePath defaults to /home/$User/dsh (derived from the SSH user)
-if (-not $RemotePath) { $RemotePath = "/home/$User/dsh" }
-
+# RemotePath defaults to /home/$User/dsh-deploy (matches prepare.sh convention)
+if (-not $RemotePath) { $RemotePath = "/home/$User/dsh-deploy" }
 # PublicHost defaults to RemoteHost (the common case: SSH IP == browser IP)
 if (-not $PublicHost) { $PublicHost = $RemoteHost }
 
@@ -67,11 +79,13 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  DSH Deployment -- DeepSeek Harness + Nginx" -ForegroundColor Cyan
+Write-Host "  DSH Full-Stack Deploy — vLLM + DeepSeek Harness" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  Remote : $User@$RemoteHost" -ForegroundColor Gray
 Write-Host "  Public : $PublicHost" -ForegroundColor Gray
 Write-Host "  Path   : $RemotePath" -ForegroundColor Gray
+Write-Host "  Model  : $ModelId" -ForegroundColor Gray
+Write-Host "  Served : $ServedModelName" -ForegroundColor Gray
 Write-Host "  Source : $ProjectRoot" -ForegroundColor Gray
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
@@ -81,7 +95,7 @@ $SecurePass = ConvertTo-SecureString $Password -AsPlainText -Force
 $Credential = New-Object System.Management.Automation.PSCredential($User, $SecurePass)
 
 # --- Establish SSH + SFTP sessions ---
-Write-Host "[1/6] Connecting to $RemoteHost ..." -ForegroundColor Yellow
+Write-Host "Pre-check: Connecting to $RemoteHost ..." -ForegroundColor Yellow
 $sshSession  = New-SSHSession  -ComputerName $RemoteHost -Credential $Credential -AcceptKey -ConnectionTimeout 15
 $sftpSession = New-SFTPSession -ComputerName $RemoteHost -Credential $Credential -AcceptKey -ConnectionTimeout 15
 
@@ -104,20 +118,34 @@ function Upload-File {
 }
 
 try {
-    # --- [2/6] Prepare remote directory ---
-    Write-Host "[2/6] Preparing remote directory ..." -ForegroundColor Yellow
-    Invoke-Remote "mkdir -p $RemotePath/nginx/conf.d $RemotePath/dsh" "create directories"
+    # --- Pre-check: Docker on remote ---
+    $dockerCheck = Invoke-Remote "docker --version && docker compose version" "check Docker" -TimeOut 30
+    if ($dockerCheck.ExitStatus -ne 0) {
+        Write-Error "Remote server does not have Docker/Docker Compose installed. Install with: curl -fsSL https://get.docker.com | sh"
+        exit 1
+    }
+    Write-Host ""
 
-    # --- [3/6] Upload project files ---
-    Write-Host "[3/6] Uploading project files ..." -ForegroundColor Yellow
+    # --- [1/5] Upload project files ---
+    Write-Host "[1/5] Uploading project files to ${RemoteHost}:${RemotePath} ..." -ForegroundColor Yellow
+
+    Invoke-Remote "mkdir -p $RemotePath/dsh $RemotePath/nginx/conf.d $RemotePath/qwen $RemotePath/scripts $RemotePath/models" "create directories"
 
     $filesToUpload = @(
         @{ Local = "$ProjectRoot\docker-compose.yml";        Remote = "$RemotePath/" },
-        @{ Local = "$ProjectRoot\.env";                      Remote = "$RemotePath/" },
+        @{ Local = "$ProjectRoot\.env.example";              Remote = "$RemotePath/" },
+        @{ Local = "$ProjectRoot\dsh\Dockerfile";            Remote = "$RemotePath/dsh/" },
+        @{ Local = "$ProjectRoot\dsh\entrypoint.sh";         Remote = "$RemotePath/dsh/" },
         @{ Local = "$ProjectRoot\nginx\nginx.conf";          Remote = "$RemotePath/nginx/" },
         @{ Local = "$ProjectRoot\nginx\conf.d\default.conf"; Remote = "$RemotePath/nginx/conf.d/" },
-        @{ Local = "$ProjectRoot\dsh\Dockerfile";            Remote = "$RemotePath/dsh/" },
-        @{ Local = "$ProjectRoot\dsh\entrypoint.sh";         Remote = "$RemotePath/dsh/" }
+        @{ Local = "$ProjectRoot\qwen\docker-compose.yml";   Remote = "$RemotePath/qwen/" },
+        @{ Local = "$ProjectRoot\qwen\Dockerfile";           Remote = "$RemotePath/qwen/" },
+        @{ Local = "$ProjectRoot\qwen\entrypoint.sh";        Remote = "$RemotePath/qwen/" },
+        @{ Local = "$ProjectRoot\scripts\prepare.sh";        Remote = "$RemotePath/scripts/" },
+        @{ Local = "$ProjectRoot\scripts\hfd.sh";            Remote = "$RemotePath/scripts/" },
+        @{ Local = "$ProjectRoot\scripts\start-vllm.sh";     Remote = "$RemotePath/scripts/" },
+        @{ Local = "$ProjectRoot\scripts\start-ai.sh";       Remote = "$RemotePath/scripts/" },
+        @{ Local = "$ProjectRoot\scripts\get-url.sh";        Remote = "$RemotePath/scripts/" }
     )
 
     foreach ($f in $filesToUpload) {
@@ -127,56 +155,73 @@ try {
             Write-Host "      ! missing $($f.Local) -- skipped" -ForegroundColor DarkYellow
         }
     }
+    Write-Host "      Upload complete (14 files)." -ForegroundColor DarkGray
+    Write-Host ""
 
-    # Fix CRLF line endings on entrypoint.sh (uploaded from Windows) and make executable
-    Invoke-Remote "sed -i 's/\r$//' $RemotePath/dsh/entrypoint.sh && chmod +x $RemotePath/dsh/entrypoint.sh" "fix entrypoint.sh line endings + chmod"
+    # --- [2/5] Fix line endings + prepare .env ---
+    Write-Host "[2/5] Fixing line endings + preparing .env ..." -ForegroundColor Yellow
 
-    # Update .env with the target host's IP so DSH_PUBLIC_URL and DSH_TRUSTED_HOST
-    # match the server being deployed to (not the default IP in the repo .env).
-    Invoke-Remote "sed -i 's|^DSH_PUBLIC_URL=.*|DSH_PUBLIC_URL=http://$PublicHost/|; s|^DSH_TRUSTED_HOST=.*|DSH_TRUSTED_HOST=$PublicHost|' $RemotePath/.env" "set DSH_PUBLIC_URL/DSH_TRUSTED_HOST to $PublicHost"
-
-    # --- [4/6] Build Docker image ---
-    Write-Host "[4/6] Building dsh Docker image (this downloads Node.js deps, may take a few minutes) ..." -ForegroundColor Yellow
-    $buildResult = Invoke-Remote "cd $RemotePath && docker compose build 2>&1" "docker compose build" -TimeOut 600
-    if ($buildResult.ExitStatus -ne 0) {
-        Write-Host "      ! build exited with status $($buildResult.ExitStatus)" -ForegroundColor DarkYellow
+    $envSetup = "set -e`ncd '$RemotePath'`n"
+    $envSetup += "find . -name '*.sh' -exec sed -i 's/\r$//' {} +`n"
+    $envSetup += "find . -name '*.sh' -exec chmod +x {} +`n"
+    $envSetup += "cp .env.example .env`n"
+    $envSetup += "sed -i 's|^DSH_PUBLIC_URL=.*|DSH_PUBLIC_URL=http://$PublicHost/|' .env`n"
+    $envSetup += "sed -i 's|^DSH_TRUSTED_HOST=.*|DSH_TRUSTED_HOST=$PublicHost|' .env`n"
+    if ($DeepseekApiKey) {
+        $envSetup += "sed -i 's|^DEEPSEEK_API_KEY=.*|DEEPSEEK_API_KEY=$DeepseekApiKey|' .env`n"
     }
 
-    # --- [5/6] Start containers ---
-    Write-Host "[5/6] Starting containers ..." -ForegroundColor Yellow
-    Invoke-Remote "cd $RemotePath && docker compose down 2>/dev/null; docker compose up -d 2>&1" "docker compose up -d"
+    $envResult = Invoke-Remote $envSetup "fix line endings + prepare .env" -TimeOut 120
+    if ($envResult.ExitStatus -ne 0) {
+        Write-Error "Failed to prepare .env on remote."
+        exit 1
+    }
+    Write-Host "      .env ready." -ForegroundColor DarkGray
+    Write-Host ""
 
-    # Wait for dsh to initialize (Node.js startup + npx fetch)
-    Write-Host "      waiting for dsh to initialize (30s) ..." -ForegroundColor DarkGray
-    Start-Sleep -Seconds 30
+    # --- [3/5] Download model (prepare.sh) ---
+    Write-Host "[3/5] Downloading model $ModelId (prepare.sh) ..." -ForegroundColor Yellow
+    Write-Host "      This may take 20-60 minutes depending on network speed." -ForegroundColor DarkGray
+    Write-Host "      Resumable — re-running the deploy script will continue from where it left off." -ForegroundColor DarkGray
 
-    Invoke-Remote "cd $RemotePath && docker compose ps 2>&1" "container status"
+    $prepareResult = Invoke-Remote "cd '$RemotePath' && bash scripts/prepare.sh -m '$ModelId' -n '$ServedModelName' 2>&1" "prepare.sh (model download)" -TimeOut 7200
+    if ($prepareResult.ExitStatus -ne 0) {
+        Write-Host "      ! prepare.sh exited with status $($prepareResult.ExitStatus)" -ForegroundColor DarkYellow
+        Write-Host "      Model download may be incomplete. Re-run the deploy script to resume." -ForegroundColor DarkYellow
+        exit 1
+    }
+    Write-Host "      Model preparation complete." -ForegroundColor DarkGray
+    Write-Host ""
 
-    # --- [6/6] Verify deployment ---
-    Write-Host "[6/6] Verifying deployment ..." -ForegroundColor Yellow
+    # --- [4/5] Start vLLM model service ---
+    Write-Host "[4/5] Starting vLLM model service (start-vllm.sh) ..." -ForegroundColor Yellow
 
-    # Check if dsh is listening on 3080
-    Invoke-Remote "ss -tlnp | grep ':3080' || echo 'dsh not yet listening on 3080'" "port 3080 check"
+    $vllmResult = Invoke-Remote "cd '$RemotePath' && bash scripts/start-vllm.sh 2>&1" "start-vllm.sh" -TimeOut 1800
+    if ($vllmResult.ExitStatus -ne 0) {
+        Write-Host "      ! start-vllm.sh exited with status $($vllmResult.ExitStatus)" -ForegroundColor DarkYellow
+        exit 1
+    }
+    Write-Host ""
 
-    # Check nginx is listening on 80
-    Invoke-Remote "ss -tlnp | grep ':80 ' || echo 'nginx not yet listening on 80'" "port 80 check"
+    # --- [5/5] Start DSH Agent + Nginx ---
+    Write-Host "[5/5] Starting DSH Agent + Nginx (start-ai.sh) ..." -ForegroundColor Yellow
 
-    # Try accessing dsh through nginx
-    Invoke-Remote "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:80/ 2>/dev/null || echo 'proxy not ready'" "nginx -> dsh proxy check"
-
-    # Container logs
-    Invoke-Remote "docker logs dsh-harness --tail 15 2>&1" "dsh-harness logs"
-    Invoke-Remote "docker logs dsh-nginx --tail 10 2>&1" "dsh-nginx logs"
+    $aiResult = Invoke-Remote "cd '$RemotePath' && bash scripts/start-ai.sh 2>&1" "start-ai.sh" -TimeOut 900
+    if ($aiResult.ExitStatus -ne 0) {
+        Write-Host "      ! start-ai.sh exited with status $($aiResult.ExitStatus)" -ForegroundColor DarkYellow
+        exit 1
+    }
 
     Write-Host ""
     Write-Host "============================================" -ForegroundColor Green
     Write-Host "  Deployment complete!" -ForegroundColor Green
     Write-Host "============================================" -ForegroundColor Green
-    Write-Host "  Web UI         : http://$PublicHost/" -ForegroundColor White
-    Write-Host "  Direct dsh     : http://127.0.0.1:3080 (host only)" -ForegroundColor Gray
+    Write-Host "  Web UI : http://$PublicHost/" -ForegroundColor White
+    Write-Host "  Model  : $ModelId (served as $ServedModelName)" -ForegroundColor Gray
     Write-Host ""
-    Write-Host "  Note: dsh binds to 127.0.0.1:3080 (loopback only)." -ForegroundColor Gray
-    Write-Host "  Access via nginx at http://$PublicHost/ on port 80." -ForegroundColor Gray
+    Write-Host "  Note: FP4 model loading takes ~20 min. Wait for health check to pass." -ForegroundColor Gray
+    Write-Host "  vLLM logs : ssh $User@$RemoteHost 'docker compose -f $RemotePath/qwen/docker-compose.yml logs -f'" -ForegroundColor Gray
+    Write-Host "  Stop all  : ssh $User@$RemoteHost 'cd $RemotePath && docker compose down && docker compose -f qwen/docker-compose.yml down'" -ForegroundColor Gray
     Write-Host "============================================" -ForegroundColor Green
     Write-Host ""
 }

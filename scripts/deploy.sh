@@ -1,114 +1,186 @@
 #!/usr/bin/env bash
 #
-# DSH (DeepSeek Harness) deployment script — bash version.
-# Deploys nginx + deepseek-harness containers to a remote Ubuntu server.
+# DSH 全栈部署脚本（bash 版）— 一键部署 vLLM + DeepSeek Harness 到全新远程服务器。
 #
-# Architecture:
-#   Container 1 (dsh-harness): Node.js + official `dsh web` CLI, binds 127.0.0.1:3080
-#   Container 2 (dsh-nginx):   Nginx reverse proxy, port 80 → 127.0.0.1:3080
-#   Both containers use network_mode: host.
+# 上传项目文件后，依次在远程执行三个脚本：
+#   1. scripts/prepare.sh    — 写入 .env + 下载模型权重（hfd.sh，可断点续传）
+#   2. scripts/start-vllm.sh — 构建并启动 vLLM 模型服务（qwen/docker-compose.yml）
+#   3. scripts/start-ai.sh   — 构建并启动 DSH Agent + Nginx，输出带 token 的 WebUI URL
 #
-# Usage:
+# 全新机器只需安装 Docker + Docker Compose；脚本自动处理其余一切。
+#
+# 用法：
 #   ./scripts/deploy.sh
-#   REMOTE_HOST=192.168.76.12 REMOTE_USER=macking REMOTE_PASS=12345678 ./scripts/deploy.sh
+#   REMOTE_HOST=192.168.76.248 REMOTE_USER=test REMOTE_PASS=123456 ./scripts/deploy.sh
 #   REMOTE_HOST=10.0.0.50 PUBLIC_HOST=dsh.example.com ./scripts/deploy.sh
+#   MODEL_ID=Qwen/Qwen3-32B SERVED_NAME=my-qwen ./scripts/deploy.sh
+#   DEEPSEEK_API_KEY=sk-xxx ./scripts/deploy.sh
 #
-# Requires: sshpass (install with: apt install sshpass / brew install sshpass)
+# 依赖：sshpass（apt install sshpass / brew install sshpass）
 #
 set -euo pipefail
 
-REMOTE_HOST="${REMOTE_HOST:-192.168.76.12}"
-REMOTE_USER="${REMOTE_USER:-macking}"
-REMOTE_PASS="${REMOTE_PASS:-12345678}"
-REMOTE_PATH="${REMOTE_PATH:-/home/${REMOTE_USER}/dsh}"
-# PUBLIC_HOST defaults to REMOTE_HOST (the common case: SSH IP == browser IP).
-# Set PUBLIC_HOST when the public URL differs from the SSH host
-# (e.g., a domain name or load balancer IP).
+# ---- 参数（可通过环境变量覆盖）----
+REMOTE_HOST="${REMOTE_HOST:-192.168.76.248}"
+REMOTE_USER="${REMOTE_USER:-test}"
+REMOTE_PASS="${REMOTE_PASS:-123456}"
+REMOTE_PATH="${REMOTE_PATH:-/home/${REMOTE_USER}/dsh-deploy}"
 PUBLIC_HOST="${PUBLIC_HOST:-$REMOTE_HOST}"
+MODEL_ID="${MODEL_ID:-nvidia/Qwen3.8-Flash-Next-FP4-Local}"
+SERVED_NAME="${SERVED_NAME:-qwen3.8-flash}"
+DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-echo ""
-echo "============================================"
-echo "  DSH Deployment — DeepSeek Harness + Nginx"
-echo "============================================"
-echo "  Remote : ${REMOTE_USER}@${REMOTE_HOST}"
-echo "  Public : ${PUBLIC_HOST}"
-echo "  Path   : ${REMOTE_PATH}"
-echo "  Source : ${PROJECT_ROOT}"
-echo "============================================"
-echo ""
-
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=15"
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=120"
 SSHPASS_CMD="sshpass -p ${REMOTE_PASS}"
 
-# --- [1/6] Check connectivity ---
-echo "[1/6] Connecting to ${REMOTE_HOST} ..."
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "echo connected" || {
-    echo "ERROR: cannot connect. Is sshpass installed? (apt install sshpass)"
+# 颜色
+RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[1;33m' BOLD='\033[1m' CYAN='\033[0;36m' NC='\033[0m'
+
+# ---- 预检：sshpass ----
+if ! command -v sshpass >/dev/null 2>&1; then
+  printf '%bERROR: sshpass 未安装。请执行：apt install sshpass / brew install sshpass%b\n' "$RED" "$NC" >&2
+  exit 1
+fi
+
+# ---- 预检：本地文件 ----
+for f in docker-compose.yml .env.example \
+         dsh/Dockerfile dsh/entrypoint.sh \
+         nginx/nginx.conf nginx/conf.d/default.conf \
+         qwen/docker-compose.yml qwen/Dockerfile qwen/entrypoint.sh \
+         scripts/prepare.sh scripts/hfd.sh scripts/start-vllm.sh scripts/start-ai.sh scripts/get-url.sh; do
+  if [[ ! -f "$PROJECT_ROOT/$f" ]]; then
+    printf '%bERROR: 缺少本地文件：%s/%s%b\n' "$RED" "$PROJECT_ROOT" "$f" "$NC" >&2
     exit 1
+  fi
+done
+
+echo ""
+printf "%b============================================%b\n" "$CYAN" "$NC"
+printf "%b  DSH 全栈部署 — vLLM + DeepSeek Harness%b\n" "$CYAN" "$NC"
+printf "%b============================================%b\n" "$CYAN" "$NC"
+printf "  Remote : %s@%s\n" "$REMOTE_USER" "$REMOTE_HOST"
+printf "  Public : %s\n" "$PUBLIC_HOST"
+printf "  Path   : %s\n" "$REMOTE_PATH"
+printf "  Model  : %s\n" "$MODEL_ID"
+printf "  Served : %s\n" "$SERVED_NAME"
+printf "  Source : %s\n" "$PROJECT_ROOT"
+printf "%b============================================%b\n" "$CYAN" "$NC"
+echo ""
+
+# ---- 预检：远程连通性 + Docker ----
+printf "%b预检：连接远程服务器 + 检查 Docker ...%b\n" "$YELLOW" "$NC"
+$SSHPASS_CMD ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+  "echo '      connected.' && docker --version && docker compose version" || {
+  printf '%bERROR: 无法连接远程服务器，或远程未安装 Docker/Docker Compose。%b\n' "$RED" "$NC" >&2
+  printf '      安装 Docker：curl -fsSL https://get.docker.com | sh\n' >&2
+  exit 1
 }
+echo ""
 
-# --- [2/6] Prepare remote directory ---
-echo "[2/6] Preparing remote directory ..."
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "mkdir -p ${REMOTE_PATH}/nginx/conf.d ${REMOTE_PATH}/dsh"
+# ---- [1/5] 上传项目文件 ----
+printf "%b[1/5] 上传项目文件到 %s:%s ...%b\n" "$YELLOW" "$REMOTE_HOST" "$REMOTE_PATH" "$NC"
 
-# --- [3/6] Upload project files ---
-echo "[3/6] Uploading project files ..."
-${SSHPASS_CMD} scp ${SSH_OPTS} \
-    "${PROJECT_ROOT}/docker-compose.yml" \
-    "${PROJECT_ROOT}/.env" \
-    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/"
+# 创建远程目录结构
+$SSHPASS_CMD ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+  "mkdir -p '$REMOTE_PATH/dsh' '$REMOTE_PATH/nginx/conf.d' '$REMOTE_PATH/qwen' '$REMOTE_PATH/scripts' '$REMOTE_PATH/models'"
 
-${SSHPASS_CMD} scp ${SSH_OPTS} \
-    "${PROJECT_ROOT}/nginx/nginx.conf" \
-    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/nginx/"
+# 按目标目录分组上传（scp 单次连接可传多个文件到同一目录）
+$SSHPASS_CMD scp $SSH_OPTS \
+    "$PROJECT_ROOT/docker-compose.yml" \
+    "$PROJECT_ROOT/.env.example" \
+    "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/"
 
-${SSHPASS_CMD} scp ${SSH_OPTS} \
-    "${PROJECT_ROOT}/nginx/conf.d/default.conf" \
-    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/nginx/conf.d/"
+$SSHPASS_CMD scp $SSH_OPTS \
+    "$PROJECT_ROOT/dsh/Dockerfile" \
+    "$PROJECT_ROOT/dsh/entrypoint.sh" \
+    "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/dsh/"
 
-${SSHPASS_CMD} scp ${SSH_OPTS} \
-    "${PROJECT_ROOT}/dsh/Dockerfile" \
-    "${PROJECT_ROOT}/dsh/entrypoint.sh" \
-    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/dsh/"
+$SSHPASS_CMD scp $SSH_OPTS \
+    "$PROJECT_ROOT/nginx/nginx.conf" \
+    "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/nginx/"
 
-# Fix CRLF line endings on entrypoint.sh (uploaded from Windows) and make executable
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "sed -i 's/\r$//' ${REMOTE_PATH}/dsh/entrypoint.sh && chmod +x ${REMOTE_PATH}/dsh/entrypoint.sh"
+$SSHPASS_CMD scp $SSH_OPTS \
+    "$PROJECT_ROOT/nginx/conf.d/default.conf" \
+    "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/nginx/conf.d/"
 
-# Update .env with the target host's IP so DSH_PUBLIC_URL and DSH_TRUSTED_HOST
-# match the server being deployed to (not the default IP in the repo .env).
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "sed -i 's|^DSH_PUBLIC_URL=.*|DSH_PUBLIC_URL=http://${PUBLIC_HOST}/|; s|^DSH_TRUSTED_HOST=.*|DSH_TRUSTED_HOST=${PUBLIC_HOST}|' ${REMOTE_PATH}/.env"
+$SSHPASS_CMD scp $SSH_OPTS \
+    "$PROJECT_ROOT/qwen/docker-compose.yml" \
+    "$PROJECT_ROOT/qwen/Dockerfile" \
+    "$PROJECT_ROOT/qwen/entrypoint.sh" \
+    "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/qwen/"
 
-# --- [4/6] Build Docker image ---
-echo "[4/6] Building dsh Docker image (may take a few minutes) ..."
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "cd ${REMOTE_PATH} && docker compose build" 2>&1
+$SSHPASS_CMD scp $SSH_OPTS \
+    "$PROJECT_ROOT/scripts/prepare.sh" \
+    "$PROJECT_ROOT/scripts/hfd.sh" \
+    "$PROJECT_ROOT/scripts/start-vllm.sh" \
+    "$PROJECT_ROOT/scripts/start-ai.sh" \
+    "$PROJECT_ROOT/scripts/get-url.sh" \
+    "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/scripts/"
 
-# --- [5/6] Start containers ---
-echo "[5/6] Starting containers ..."
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "cd ${REMOTE_PATH} && docker compose down 2>/dev/null; docker compose up -d" 2>&1
+printf "      上传完成（14 个文件）。\n\n"
 
-echo "      waiting for dsh to initialize (30s) ..."
-sleep 30
+# ---- [2/5] 修复行尾 + 准备 .env ----
+printf "%b[2/5] 修复行尾 + 准备 .env ...%b\n" "$YELLOW" "$NC"
 
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "cd ${REMOTE_PATH} && docker compose ps"
+# 通过环境变量传递参数到远程 bash；heredoc 用引号定界符防止本地展开。
+$SSHPASS_CMD ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+  "REMOTE_PATH='$REMOTE_PATH' PUBLIC_HOST='$PUBLIC_HOST' DEEPSEEK_API_KEY='$DEEPSEEK_API_KEY' bash -s" <<'REMOTE_SETUP'
+set -e
+cd "$REMOTE_PATH"
 
-# --- [6/6] Verify deployment ---
-echo "[6/6] Verifying deployment ..."
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "ss -tlnp | grep ':3080' || echo 'dsh not yet listening on 3080'"
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "ss -tlnp | grep ':80 ' || echo 'nginx not yet listening on 80'"
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:80/ 2>/dev/null || echo 'proxy not ready'"
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "docker logs dsh-harness --tail 15 2>&1"
-${SSHPASS_CMD} ssh ${SSH_OPTS} ${REMOTE_USER}@${REMOTE_HOST} "docker logs dsh-nginx --tail 10 2>&1"
+# 修复所有 .sh 文件的 CRLF 行尾并添加执行权限
+find . -name '*.sh' -exec sed -i 's/\r$//' {} +
+find . -name '*.sh' -exec chmod +x {} +
+
+# 从 .env.example 创建 .env（prepare.sh 稍后追加模型相关变量）
+cp .env.example .env
+sed -i "s|^DSH_PUBLIC_URL=.*|DSH_PUBLIC_URL=http://$PUBLIC_HOST/|" .env
+sed -i "s|^DSH_TRUSTED_HOST=.*|DSH_TRUSTED_HOST=$PUBLIC_HOST|" .env
+if [ -n "$DEEPSEEK_API_KEY" ]; then
+  sed -i "s|^DEEPSEEK_API_KEY=.*|DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY|" .env
+fi
+
+echo "      .env ready."
+REMOTE_SETUP
+
+printf "      .env 已准备。\n\n"
+
+# ---- [3/5] 下载模型（prepare.sh）----
+printf "%b[3/5] 下载模型 %s（prepare.sh）...%b\n" "$YELLOW" "$MODEL_ID" "$NC"
+printf "      模型较大，可能需要 20-60 分钟（支持断点续传，重跑即续传）。\n"
+
+$SSHPASS_CMD ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+  "cd '$REMOTE_PATH' && bash scripts/prepare.sh -m '$MODEL_ID' -n '$SERVED_NAME'" 2>&1
+
+printf "      模型准备完成。\n\n"
+
+# ---- [4/5] 启动 vLLM 模型服务 ----
+printf "%b[4/5] 启动 vLLM 模型服务（start-vllm.sh）...%b\n" "$YELLOW" "$NC"
+
+$SSHPASS_CMD ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+  "cd '$REMOTE_PATH' && bash scripts/start-vllm.sh" 2>&1
+
+printf "\n"
+
+# ---- [5/5] 启动 DSH Agent + Nginx ----
+printf "%b[5/5] 启动 DSH Agent + Nginx（start-ai.sh）...%b\n" "$YELLOW" "$NC"
+
+$SSHPASS_CMD ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+  "cd '$REMOTE_PATH' && bash scripts/start-ai.sh" 2>&1
 
 echo ""
-echo "============================================"
-echo "  Deployment complete!"
-echo "============================================"
-echo "  Web UI         : http://${PUBLIC_HOST}/"
-echo "  Direct dsh     : http://127.0.0.1:3080 (host only)"
+printf "%b============================================%b\n" "$GREEN" "$NC"
+printf "%b  部署完成！%b\n" "$GREEN" "$NC"
+printf "%b============================================%b\n" "$GREEN" "$NC"
+printf "  Web UI : http://%s/\n" "$PUBLIC_HOST"
+printf "  模型   : %s（服务名 %s）\n" "$MODEL_ID" "$SERVED_NAME"
 echo ""
-echo "  Note: dsh binds to 127.0.0.1:3080 (loopback only)."
-echo "  Access via nginx at http://${PUBLIC_HOST}/ on port 80."
-echo "============================================"
+printf "  提示：FP4 模型加载约需 20 分钟，健康检查通过后即可使用。\n"
+printf "  vLLM 日志：ssh %s@%s 'docker compose -f %s/qwen/docker-compose.yml logs -f'\n" \
+  "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PATH"
+printf "  停止全部：ssh %s@%s 'cd %s && docker compose down && docker compose -f qwen/docker-compose.yml down'\n" \
+  "$REMOTE_USER" "$REMOTE_HOST" "$REMOTE_PATH"
+printf "%b============================================%b\n" "$GREEN" "$NC"
 echo ""
