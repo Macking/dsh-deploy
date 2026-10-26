@@ -90,9 +90,10 @@ dsh-deploy/
 git clone https://github.com/Macking/dsh-deploy.git "$HOME/dsh-deploy"
 cd "$HOME/dsh-deploy"
 bash scripts/prepare.sh -m nvidia/Qwen3.8-Flash-Next-FP4-Local -n qwen3.8-flash
-bash scripts/start-vllm.sh   # 构建并启动 vLLM 模型服务
-bash scripts/start-ai.sh     # 构建并启动 DSH Agent + Nginx，打印 WebUI URL
+bash scripts/start-vllm.sh   # Build and start up vLLm model service
+bash scripts/start-ai.sh     # Build and start up DSH Agent + Nginx, fetch WebUI URL
 ```
+Copy the WebUI URL show in the console, navigate in browser to use.
 
 ### From Windows (PowerShell)
 

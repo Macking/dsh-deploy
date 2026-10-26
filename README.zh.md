@@ -93,6 +93,7 @@ bash scripts/prepare.sh -m nvidia/Qwen3.8-Flash-Next-FP4-Local -n qwen3.8-flash
 bash scripts/start-vllm.sh   # 构建并启动 vLLM 模型服务
 bash scripts/start-ai.sh     # 构建并启动 DSH Agent + Nginx，打印 WebUI URL
 ```
+从上面控制台复制WebUI URL，打开浏览器后粘贴回车，即可开始使用。
 
 ### 从 Windows 部署（PowerShell）
 
