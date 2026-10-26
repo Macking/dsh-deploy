@@ -1,3 +1,5 @@
+[English](README.md) | 中文
+
 # DeepSeek Harness (dsh) 部署
 
 通过 Docker Compose，在远程 Ubuntu 服务器上以 Nginx 反向代理的方式部署官方 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）Web UI。

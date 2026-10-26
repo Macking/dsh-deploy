@@ -1,3 +1,5 @@
+English | [中文](README.zh.md)
+
 # DeepSeek Harness (dsh) Deployment
 
 Deploy the official [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) web UI behind an Nginx reverse proxy on a remote Ubuntu server, using Docker Compose.
