@@ -11,7 +11,7 @@ Deploy the official [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-h
 │  ┌──────────────┐    ┌───────────────────────────┐  │
 │  │  dsh-nginx   │    │  dsh-harness              │  │
 │  │  (nginx)     │    │  (Node.js + dsh web)      │  │
-│  │  port :80    │───▶│  127.0.0.1:3080           │  │
+│  │  port :80    │──▶│  127.0.0.1:3080           │  │
 │  │  host network│    │  host network (loopback)  │  │
 │  └──────────────┘    └───────────────────────────┘  │
 │         │                                           │
@@ -39,24 +39,58 @@ Deploy the official [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-h
 ## Project structure
 
 ```
-dsh/
-├── docker-compose.yml      # Two services: dsh-harness + dsh-nginx
-├── .env                    # Environment config (API key, public URL)
-├── dsh/
+dsh-deploy/
+├── docker-compose.yml      # Agent stack: dsh-harness + dsh-nginx
+├── .env                    # Environment config (API key, public URL, model paths)
+├── .env.example            # Template .env with documented variables
+│
+├── dsh/                    # Agent image (DeepSeek Harness web UI)
 │   ├── Dockerfile          # Node.js 22 + npm install @deepseek-ai/dsh
 │   └── entrypoint.sh       # Translates env vars → dsh web CLI flags
-├── nginx/
+│
+├── nginx/                  # Reverse proxy: :80 → 127.0.0.1:3080
 │   ├── nginx.conf          # Main nginx config
 │   └── conf.d/
-│       └── default.conf     # Reverse proxy: :80 → 127.0.0.1:3080
+│       └── default.conf    # Proxy rules + WebSocket/SSE support
+│
+├── qwen/                   # Model service image (vLLM + Qwen3.8-Flash-Next-FP4)
+│   ├── docker-compose.yml  # GPU passthrough, host network, model volume mount
+│   ├── Dockerfile          # Based on eugr/spark-vllm-b12x, bakes runtime ENV
+│   └── entrypoint.sh       # vllm serve wrapper (model path + served name as args)
+│
+├── models/                 # Downloaded model weights (populated by prepare.sh)
+│   └── .gitkeep            # Placeholder so git tracks the empty directory
+│
 └── scripts/
-    ├── deploy.ps1          # Windows deployment script (Posh-SSH)
-    ├── deploy.sh           # Linux/macOS deployment script (sshpass)
-    ├── get-url.ps1         # Fetch the WebUI launch URL with token (Windows)
-    └── get-url.sh          # Fetch the WebUI launch URL with token (Linux/macOS/server)
+    │
+    │  ── New-machine setup & model download ──
+    ├── prepare.sh          # Export DSH_DEPLOY_HOME/MODEL_ID, write .env, download model
+    ├── hfd.sh              # HuggingFace downloader (resumable, via hf-mirror.com)
+    │
+    │  ── Service startup (run on the server) ──
+    ├── start-vllm.sh       # Build + start qwen/ compose (vLLM model service)
+    ├── start-ai.sh         # Build + start root compose (dsh + nginx), print WebUI URL
+    │
+    │  ── Remote deployment (run from local machine) ──
+    ├── deploy.ps1          # Windows: upload + build + start via SSH/SFTP (Posh-SSH)
+    ├── deploy.sh           # Linux/macOS: same via sshpass
+    │
+    │  ── WebUI URL helper ──
+    ├── get-url.ps1         # Fetch the launch URL with token (Windows)
+    └── get-url.sh          # Fetch the launch URL with token (Linux/macOS/server)
 ```
 
 ## Deployment
+
+### Usage (Local machine)
+
+```bash
+git clone https://github.com/Macking/dsh-deploy.git "$HOME/dsh-deploy"
+cd "$HOME/dsh-deploy"
+bash scripts/prepare.sh -m nvidia/Qwen3.8-Flash-Next-FP4-Local -n qwen3.8-flash
+bash scripts/start-vllm.sh   # 构建并启动 vLLM 模型服务
+bash scripts/start-ai.sh     # 构建并启动 DSH Agent + Nginx，打印 WebUI URL
+```
 
 ### From Windows (PowerShell)
 

@@ -12,3 +12,7 @@ Thumbs.db
 
 # Temp
 .tmp/
+
+# Model weights — downloaded by scripts/prepare.sh, do not commit
+models/*
+!models/.gitkeep

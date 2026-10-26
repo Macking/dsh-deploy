@@ -1,0 +1,4 @@
+# This file ensures the models/ directory exists after git clone.
+# Model weights are downloaded by scripts/prepare.sh into subdirectories
+# (e.g. models/nvidia/Qwen3.8-Flash-Next-FP4-Local/) and are excluded
+# from version control via .gitignore (models/*, !models/.gitkeep).
