@@ -23,6 +23,13 @@ services:
       context: .
       dockerfile: Dockerfile
     image: spark-vllm-b12x-qwen3.8-flash:latest
+    # ---- 启动参数（模型路径 + 服务名，由 .env 提供）-----------------
+    # entrypoint.sh 接收两个位置参数：$1=模型路径, $2=服务名。
+    # compose 从 qwen/.env 读取 MODEL_ID 与 SERVED_MODEL_NAME（由 prepare.sh 写入）；
+    # 改 .env 后 docker compose up -d 即可生效，无需重新编译镜像。
+    command:
+      - "/models/${MODEL_ID:-nvidia/Qwen3.8-Flash-Next-FP4-Local}"
+      - "${SERVED_MODEL_NAME:-qwen3.8-flash}"
     container_name: qwen-vllm-serve
 
     # ---- 网络 / IPC（等价 --network host --ipc host）----------------
@@ -56,10 +63,13 @@ services:
       - apparmor:unconfined
 
     # ---- 卷挂载（模型只读 + 各类缓存）-------------------------------
-    # /home/test/project 为宿主机模型目录（原命令字面值，按需修改）。
+    # 宿主机模型目录 $DSH_DEPLOY_HOME/models -> 容器 /models（只读）。
+    # DSH_DEPLOY_HOME 由 prepare.sh 导出并写入 .env；缺省回退到 $HOME/dsh-deploy。
+    # 模型实际位于 /models/<MODEL_ID>（如 /models/nvidia/Qwen3.8-Flash-Next-FP4-Local），
+    # 与 Dockerfile 内 MODEL_PATH 一致。
     # 其余 ${HOME}/... 为宿主机缓存目录，与容器内路径一一对应。
     volumes:
-      - /home/test/project:/models/local:ro
+      - ${DSH_DEPLOY_HOME:-$HOME/dsh-deploy}/models:/models:ro
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
       - ${HOME}/.cache/vllm:/root/.cache/vllm
       - ${HOME}/.cache/flashinfer:/root/.cache/flashinfer
@@ -74,9 +84,7 @@ services:
     # 该镜像无 `python` 符号链接，仅有 python3，故探测命令用 python3；
     # 也可改用自带 curl（curl 8.5 已确认存在于镜像）。
     healthcheck:
-      test:
-        - CMD-SHELL
-        - "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status==200 else 1)\" || curl -fsS http://127.0.0.1:8000/health >/dev/null"
+      test: ["CMD-SHELL", "curl -f -m 10 -o /dev/null http://127.0.0.1:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 5

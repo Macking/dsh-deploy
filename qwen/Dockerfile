@@ -3,8 +3,13 @@
 #       的全部运行时环境变量与 vllm serve 启动命令。
 #
 # 将原 `docker run` 后在容器内 `export` 的变量烘焙为 ENV，
-# 并把 `vllm serve ...` 设为 ENTRYPOINT，使镜像可直接由
-# docker compose 拉起，无需再手动 export 或手输参数。
+# 并把 `vllm serve ...` 设为 ENTRYPOINT（经由 entrypoint.sh 包装），
+# 使镜像可直接由 docker compose 拉起，无需再手动 export 或手输参数。
+#
+# 模型路径与服务名通过 docker compose 的 command: 传入（值来自 .env），
+# 与 prepare.sh 的下载路径 $DSH_DEPLOY_HOME/models/<MODEL_ID> 对齐
+# （宿主机 $DSH_DEPLOY_HOME/models 挂载到容器 /models）。
+# 镜像本身不含模型路径——同一镜像可服务不同模型，无需重新编译。
 #
 # 构建：  docker build -t spark-vllm-b12x-qwen3.8-flash:latest .
 # =====================================================================
@@ -33,37 +38,14 @@ ENV HF_HUB_OFFLINE=1
 ENV HF_HOME=/root/.cache/huggingface
 
 # ---------------------------------------------------------------------
-# 入口：vllm serve
-# 采用 exec（JSON 数组）形式：每个参数独立成元素，避免 shell 对
-# --speculative-config / --compilation-config 中 JSON 串的引号转义问题。
-# 行尾反斜杠为 Dockerfile 续行符，会被先合并成单行再按 JSON 解析。
-# 顺序与原命令完全一致。
+# 入口：entrypoint.sh 接收两个位置参数：$1=模型路径, $2=服务名。
+# CMD 提供默认值（独立 docker run 时生效）；
+# docker compose 通过 command: 覆盖（值来自 .env，由 prepare.sh 写入）。
+# exec 确保信号正确传递；JSON 配置串在脚本内用单引号包裹。
 # ---------------------------------------------------------------------
-ENTRYPOINT ["vllm", "serve", "/models/local/Qwen3.8-Flash-Next-FP4-Local", \
-  "--host", "0.0.0.0", \
-  "--port", "8000", \
-  "--served-model-name", "qwen3.8-flash", \
-  "--tensor-parallel-size", "1", \
-  "--pipeline-parallel-size", "1", \
-  "--mamba-cache-mode", "align", \
-  "--enable-prefix-caching", \
-  "--enable-chunked-prefill", \
-  "--dtype", "bfloat16", \
-  "--kv-cache-dtype", "fp8", \
-  "--quantization", "modelopt_mixed", \
-  "--block-size", "16", \
-  "--load-format", "b12x", \
-  "--max-model-len", "262144", \
-  "--max-num-seqs", "8", \
-  "--max-num-batched-tokens", "4096", \
-  "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":4}", \
-  "--gdn-decode-kernel", "b12x", \
-  "--linear-backend", "b12x", \
-  "--moe-backend", "b12x", \
-  "--no-enable-flashinfer-autotune", \
-  "--mm-encoder-tp-mode", "data", \
-  "--reasoning-parser", "qwen3", \
-  "--tool-call-parser", "qwen3_xml", \
-  "--enable-auto-tool-choice", \
-  "--compilation-config", "{\"pass_config\":{\"fuse_act_quant\":true}}", \
-  "--gpu-memory-utilization", "0.8"]
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+# 默认参数：模型路径, 服务名。docker compose 通过 command: 覆盖。
+CMD ["/models/nvidia/Qwen3.8-Flash-Next-FP4-Local", "qwen3.8-flash"]
