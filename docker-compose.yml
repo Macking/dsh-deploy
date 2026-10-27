@@ -27,8 +27,10 @@ services:
       # The web UI also lets you configure models at runtime via Settings.
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
     volumes:
-      - dsh-home:/dsh-home
-      - dsh-workspace:/workspace
+      # Persist dsh home + workspace on the host so data survives container
+      # recreation and is independent of the deployment directory.
+      - ~/.dsh_deploy/volumes/dsh-home:/dsh-home
+      - ~/.dsh_deploy/volumes/dsh-workspace:/workspace
     healthcheck:
       # DSH returns 401 for unauthenticated API pings, which is a healthy
       # response (server is up). We only fail on 000 (connection refused).
@@ -54,7 +56,3 @@ services:
     depends_on:
       deepseek-harness:
         condition: service_healthy
-
-volumes:
-  dsh-home:
-  dsh-workspace:

@@ -8,7 +8,9 @@
 #   2. 将上述变量写入 $DSH_DEPLOY_HOME/.env 与 $DSH_DEPLOY_HOME/qwen/.env，使
 #      docker compose 无需 source 即可读取（compose 默认从 compose 文件所在目录
 #      读取 .env，即 qwen/.env）。
-#   3. 被【直接执行】时（如 `bash scripts/prepare.sh`），额外调用 scripts/hfd.sh
+#   3. 创建 DSH Agent 绑定挂载目录 $HOME/.dsh_deploy/volumes/{dsh-home,dsh-workspace}，
+#      使 docker-compose.yml 中的绑定挂载在容器启动前就存在且属主为当前用户。
+#   4. 被【直接执行】时（如 `bash scripts/prepare.sh`），额外调用 scripts/hfd.sh
 #      下载模型到 $DSH_DEPLOY_HOME/models/<MODEL_ID>；被【source】时只导出变量，不阻塞当前 shell。
 #
 # 用法：
@@ -52,6 +54,11 @@
 #     $DSH_DEPLOY_HOME/qwen/.env   —— docker compose 自动加载处（关键）
 #   compose 默认从 compose 文件所在目录读取 .env（即 qwen/），
 #   故 qwen/.env 是实际生效的路径。仅新增/更新这三行，保留其他内容。
+#
+# 绑定挂载目录：
+#   DSH Agent 的持久化卷（dsh-home / dsh-workspace）映射到
+#   $HOME/.dsh_deploy/volumes/ 下的绑定挂载。prepare.sh 提前创建
+#   这两个目录，避免 Docker 以 root 身份自动创建导致属主为 root。
 #
 # 注意：本脚本设计为可被 source，故不启用 `set -e`/`set -u`——
 #       否则 errexit/nounset 会泄漏到父 shell，影响后续命令执行。
@@ -134,6 +141,15 @@ update_env_file() {
   __prepare_write_env_kv "$DSH_DEPLOY_HOME/qwen/.env"
 }
 
+# ---- 创建 DSH Agent 绑定挂载目录 ----
+# docker-compose.yml 将 dsh-home / dsh-workspace 卷映射到
+# $HOME/.dsh_deploy/volumes/ 下的绑定挂载。提前创建可避免 Docker
+# 以 root 身份自动创建（届时目录属主为 root，用户不便备份/检查）。
+ensure_volume_dirs() {
+  local base="$HOME/.dsh_deploy/volumes"
+  mkdir -p "$base/dsh-home" "$base/dsh-workspace"
+}
+
 # ---- 模型下载（仅在被直接执行时运行；source 模式只导出环境变量）----
 # hfd.sh 可断点续传、幂等：已下载完整则秒退，中断后重跑即续传。
 # 模型 ID 由 --model/-m 提供，同时作为 hfd.sh 的仓库 ID 与本地子目录
@@ -182,7 +198,7 @@ run_model_download() {
 
 # ---- 清理内部函数与临时变量（两个分支共用）----
 __prepare_cleanup() {
-  unset -f __prepare_set_kv __prepare_write_env_kv update_env_file run_model_download \
+  unset -f __prepare_set_kv __prepare_write_env_kv update_env_file ensure_volume_dirs run_model_download \
          __prepare_cleanup 2>/dev/null
   unset __prepare_model __prepare_served_name 2>/dev/null
 }
@@ -225,6 +241,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 
   # 持久化到 .env（下载前写入：即使下载失败，.env 也记录了意图，便于重跑）
   update_env_file
+  ensure_volume_dirs
 
   run_model_download
   __prepare_dl_rc=$?
@@ -241,6 +258,7 @@ else
   # 此处不解析 --model/--name：source 模式不下载，参数无意义；
   # 亦避免解析失败时 exit 杀掉父 shell。MODEL_ID/SERVED_MODEL_NAME 从 .env 读取（或用默认值）。
   update_env_file
+  ensure_volume_dirs
   __prepare_cleanup
   printf '[prepare.sh] DSH_DEPLOY_HOME=%s\n' "$DSH_DEPLOY_HOME"
   printf '[prepare.sh] MODEL_ID=%s\n' "$MODEL_ID"
