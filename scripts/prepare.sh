@@ -147,7 +147,7 @@ update_env_file() {
 # 以 root 身份自动创建（届时目录属主为 root，用户不便备份/检查）。
 ensure_volume_dirs() {
   local base="$HOME/.dsh_deploy/volumes"
-  mkdir -p "$base/dsh-home" "$base/dsh-workspace"
+  mkdir -p "$base/dsh-home" "$base/dsh-workspace" "$base/dsh-root"
 }
 
 # ---- 模型下载（仅在被直接执行时运行；source 模式只导出环境变量）----

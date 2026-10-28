@@ -33,6 +33,7 @@ services:
       # recreation and is independent of the deployment directory.
       - ~/.dsh_deploy/volumes/dsh-home:/dsh-home
       - ~/.dsh_deploy/volumes/dsh-workspace:/workspace
+      - ~/.dsh_deploy/volumes/dsh-root:/root
     healthcheck:
       # DSH returns 401 for unauthenticated API pings, which is a healthy
       # response (server is up). We only fail on 000 (connection refused).
