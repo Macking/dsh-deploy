@@ -16,12 +16,14 @@ services:
       # DSH home directory (persisted via volume)
       - DSH_HOME=/dsh-home
       # Browser-facing URL that dsh advertises in its UI and startup output.
-      # Read from .env so the same compose file works on any server IP.
+      # Defaults to http://localhost/ which triggers auto-detection of the
+      # server's LAN IP in entrypoint.sh. Set DSH_PUBLIC_URL in .env to pin
+      # a specific URL (e.g., a domain name behind a load balancer).
       - DSH_PUBLIC_URL=${DSH_PUBLIC_URL:-http://localhost/}
       # The authority browsers use to reach the deployment.
       # DSH's host fence rejects any other Host header, so set this to the
       # browser-visible hostname or IP. An entry without a port matches any port.
-      # Read from .env so the same compose file works on any server IP.
+      # Defaults to localhost which triggers auto-detection in entrypoint.sh.
       - DSH_TRUSTED_HOST=${DSH_TRUSTED_HOST:-localhost}
       # DeepSeek API key — set in .env or here directly.
       # The web UI also lets you configure models at runtime via Settings.

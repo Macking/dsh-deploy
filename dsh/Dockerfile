@@ -12,7 +12,7 @@ RUN set -eux; \
         /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        git bash curl ca-certificates zip unzip; \
+        git bash curl ca-certificates zip unzip iproute2; \
     rm -rf /var/lib/apt/lists/*; \
     apt-get clean
 
